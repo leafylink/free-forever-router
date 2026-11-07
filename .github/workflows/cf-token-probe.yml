@@ -1,0 +1,19 @@
+name: Cloudflare token probe (no deploy)
+on:
+  push:
+    branches: [probe/cf-token-2026-11-07]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Is a Cloudflare token available to this repo, and is it valid? (prints yes/no only)
+        env:
+          T: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          A: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$T" ]; then echo "CLOUDFLARE_API_TOKEN: missing"; else echo "CLOUDFLARE_API_TOKEN: present"; fi
+          if [ -z "$A" ]; then echo "CLOUDFLARE_ACCOUNT_ID: missing"; else echo "CLOUDFLARE_ACCOUNT_ID: present"; fi
+          if [ -n "$T" ]; then
+            ok=$(curl -s -H "Authorization: Bearer $T" https://api.cloudflare.com/client/v4/user/tokens/verify | python3 -c 'import sys,json;print(json.load(sys.stdin).get("success"))')
+            echo "token valid: $ok"
+          fi
