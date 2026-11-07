@@ -1,0 +1,9 @@
+{
+  "name": "jell0-router",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare-only LLM router on Workers AI (OpenAI and Anthropic endpoints)",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

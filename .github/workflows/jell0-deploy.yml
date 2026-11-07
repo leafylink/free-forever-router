@@ -1,0 +1,114 @@
+# Deploys jell0-router (workers.dev only, no routes or custom domains) to Cloudflare.
+# Manual only: run it from the Actions tab, and only on the owner's word. The deploy job runs only
+# from main: dispatched from any other branch, it is skipped, so a stale branch cannot roll jell0 back.
+# Tests run first; a no-key smoke test on the live host must pass or the job fails.
+# BEFORE THE FIRST RUN: this file must be on main (it is git-ignored, so add it by hand), a fresh
+# JELL0_ADMIN_TOKEN in the v2 format ("jell0-admin-v2." plus 40+ random characters; admin stays off
+# with anything else) must be set on jell0-router, and every secret the old, open jell0 held counts
+# as leaked. See jell0/README.md, "Before the first deploy".
+# Model routes take only a KV key from the jell0 admin API or a Manager key whose ONLY permission is
+# AI models; the shared bearer the box used with the old jell0 gets 401 once this deploys.
+# Optional repo secret JELL0_SMOKE_KEY (one of those two kinds of key) adds one keyed call; it is
+# never printed.
+name: jell0 deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jell0-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jell0
+    env:
+      BASE: https://jell0-router.jonathan-d7a.workers.dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Tests
+        run: node --test test/*.test.mjs
+
+      - name: Deploy jell0-router
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4 deploy
+
+      - name: Smoke test the live host (no key)
+        run: |
+          set -u
+          fail=0
+          tmp=$(mktemp -d)
+          check() { # name, wanted status, got status
+            if [ "$3" = "$2" ]; then echo "ok   $1 ($3)"; else echo "FAIL $1: wanted $2, got $3"; fail=1; fi
+          }
+          code() { curl -s -o "$tmp/body" -w '%{http_code}' --max-time 30 "$@"; }
+
+          # wait for the new version: the removed provider endpoint answers 404 once it is live
+          for i in $(seq 1 18); do
+            [ "$(code "$BASE/api/jell0/providers")" = "404" ] && break
+            sleep 5
+          done
+
+          check "GET /health" 200 "$(code "$BASE/health")"
+
+          check "GET /v1/models" 200 "$(code "$BASE/v1/models")"
+          for id in jell0-flagship glm-5.3; do
+            if jq -e --arg id "$id" '.data | map(.id) | index($id) != null' "$tmp/body" > /dev/null; then
+              echo "ok   /v1/models lists $id"
+            else
+              echo "FAIL /v1/models does not list $id"; fail=1
+            fi
+          done
+
+          check "POST /v1/chat/completions, no key" 401 "$(code -X POST -H 'content-type: application/json' \
+            -d '{"model":"jell0-flagship","messages":[{"role":"user","content":"hi"}]}' "$BASE/v1/chat/completions")"
+
+          check "POST /api/jell0/keys, no admin token" 401 "$(code -X POST -H 'content-type: application/json' \
+            -d '{"label":"smoke"}' "$BASE/api/jell0/keys")"
+
+          check "POST /v1/messages, no key" 401 "$(code -X POST -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+            -d '{"model":"claude-opus-4-1","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}' "$BASE/v1/messages")"
+          if jq -e '.type == "error" and .error.type == "authentication_error"' "$tmp/body" > /dev/null; then
+            echo "ok   /v1/messages 401 has an Anthropic error body"
+          else
+            echo "FAIL /v1/messages 401 body is not an Anthropic error"; fail=1
+          fi
+
+          check "GET /api/jell0/discover" 404 "$(code "$BASE/api/jell0/discover")"
+          check "GET /api/jell0/providers" 404 "$(code "$BASE/api/jell0/providers")"
+
+          rm -rf "$tmp"
+          exit $fail
+
+      - name: Smoke test one keyed call (only when JELL0_SMOKE_KEY is set)
+        env:
+          SMOKE_KEY: ${{ secrets.JELL0_SMOKE_KEY }}
+        run: |
+          set -u
+          if [ -z "${SMOKE_KEY:-}" ]; then echo "skip keyed check: JELL0_SMOKE_KEY is not set"; exit 0; fi
+          tmp=$(mktemp -d)
+          status=$(curl -s -o "$tmp/body" -D "$tmp/headers" -w '%{http_code}' --max-time 60 -X POST \
+            -H "Authorization: Bearer $SMOKE_KEY" -H 'content-type: application/json' \
+            -d '{"model":"jell0-fast","max_tokens":1,"messages":[{"role":"user","content":"Say ok."}]}' \
+            "$BASE/v1/chat/completions")
+          routed=$(grep -i '^x-jell0-routed:' "$tmp/headers" | head -n 1 | cut -d' ' -f2- | tr -d '\r')
+          rm -rf "$tmp"
+          if [ "$status" = "200" ] && [ "${routed#workersai/}" != "$routed" ]; then
+            echo "ok   keyed POST /v1/chat/completions (200, $routed)"
+          else
+            echo "FAIL keyed POST /v1/chat/completions: status $status, routed '$routed'"; exit 1
+          fi

@@ -1,0 +1,53 @@
+# jell0-router: Cloudflare-only LLM router on Workers AI.
+# Deploy ONLY through the jell0-deploy GitHub workflow (.github/workflows/jell0-deploy.yml),
+# and only on the owner's word. Never deploy it from the box or by hand.
+# workers.dev only: never add route, routes or custom domains here.
+# BEFORE THE FIRST DEPLOY: set a fresh JELL0_ADMIN_TOKEN in the v2 format ("jell0-admin-v2." plus
+# 40+ random characters; admin stays off with any other value, the old token included) and treat
+# every secret and KV provider key the old jell0 held as leaked (its admin API was open). After it:
+# delete the old provider secrets. The steps are in README.md, "Before the first deploy".
+# Model routes take only a KV key made by this jell0's admin API or a Manager key whose ONLY
+# permission is AI models. The shared bearer the box used with the old jell0 gets 401, so the box
+# and OpenCode each need one of those keys to connect (README.md, "Auth" and "Setup").
+name = "jell0-router"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+workers_dev = true
+keep_vars = true
+
+# KV: one "key:<sha256>" entry per key (managed through /api/jell0/keys), and the old
+# "api_keys" list, kept only so its entries can be deleted.
+[[kv_namespaces]]
+binding = "JELL0_CONFIG"
+id = "5ca5fe6524674fd68d001c0c583de130"
+
+# Workers AI: every model call goes through this binding.
+[ai]
+binding = "AI"
+
+# LeafyLink D1: mgr_api_key, to accept Manager keys whose only permission is "ai_models".
+# jell0 only reads it; the binding itself can write.
+[[d1_databases]]
+binding = "MGR_DB"
+database_name = "leafylink"
+database_id = "e2dcd27b-90d7-4108-8791-081ed33e7769"
+
+# Rate limits (Workers Rate Limiting, per Cloudflare location, approximate). JELL0_IP_LIMIT runs
+# first on every model route, before any KV or D1 lookup, keyed by the caller's IP. JELL0_KEY_LIMIT
+# runs once the key is known, keyed by the key's SHA-256: a cost guard for a leaked key or a
+# runaway client. Over either: 429. namespace_id must be unique in the Cloudflare account.
+[[ratelimits]]
+name = "JELL0_IP_LIMIT"
+namespace_id = "6101"
+
+  [ratelimits.simple]
+  limit = 120
+  period = 60
+
+[[ratelimits]]
+name = "JELL0_KEY_LIMIT"
+namespace_id = "6102"
+
+  [ratelimits.simple]
+  limit = 60
+  period = 60
