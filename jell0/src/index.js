@@ -20,7 +20,7 @@ import { anthropicToOpenAI, openAIToAnthropic, openAISSEToAnthropicSSE, countTok
 import { planRoute, modelList, biggestContext } from './catalog.js'
 import { runChain } from './workersai.js'
 import { keyPage } from './keypage.js'
-import { adminOk, adminOff, keyKind, keyFromRequest, addKvKey, listKvKeys, loadOldKeys, deleteKvKey, overLimit, sha256hex } from './keys.js'
+import { adminOk, adminOff, keyKind, keyFromRequest, addKvKey, listKvKeys, loadOldKeys, deleteKvKey, overLimit, sha256hex, keyLanes } from './keys.js'
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -78,6 +78,12 @@ function noModelMessage(plan) {
     plan.needs.output + ' token output budget; no Cloudflare model in the ' + plan.lane + ' lane' + (want.length ? ' with ' + want.join(' and ') : '') + ' can take it).'
 }
 
+// A key limited to some lanes may not use others (set on the key page).
+async function laneRefused(env, request, plan) {
+  const lanes = await keyLanes(env, request)
+  return lanes.length && !lanes.includes(plan.lane) ? 'jell0: this key may only use: ' + lanes.join(', ') + ' (asked for ' + plan.lane + ').' : null
+}
+
 const UNAUTHORIZED = 'Missing or invalid API key for jell0.'
 const LIMITED = 'jell0: too many requests. Try again in a minute.'
 const RETRY_AFTER = { 'Retry-After': '20' }
@@ -119,6 +125,8 @@ async function chat(request, env) {
   const plan = planRoute(body, { preference: request.headers.get('X-Jell0-Preference') }, Date.now())
   if (plan.cap && plan.needs.tokens > plan.cap) return openaiError(400, tooLongMessage(plan), 'invalid_request_error', 'prompt_too_large')
   if (!plan.chain.length) return openaiError(400, noModelMessage(plan), 'invalid_request_error', 'no_model_fits')
+  const laneNo = await laneRefused(env, request, plan)
+  if (laneNo) return openaiError(403, laneNo, 'permission_error', 'lane_not_allowed')
   return runChain(env, body, { stream: body.stream === true, chain: plan.chain, lane: plan.lane, overflow: plan.overflow })
 }
 
@@ -144,6 +152,8 @@ async function messages(request, env) {
   const plan = planRoute({ ...t.openai, model: t.requestedModel }, { preference: request.headers.get('X-Jell0-Preference'), anthropic: true }, Date.now())
   if (plan.cap && plan.needs.tokens > plan.cap) return anthropicError(400, 'invalid_request_error', tooLongMessage(plan))
   if (!plan.chain.length) return anthropicError(400, 'invalid_request_error', noModelMessage(plan))
+  const laneNo = await laneRefused(env, request, plan)
+  if (laneNo) return anthropicError(403, 'permission_error', laneNo)
   const res = await runChain(env, t.openai, { stream: t.stream, chain: plan.chain, lane: plan.lane, overflow: plan.overflow })
   const extra = { 'X-Jell0-Routed': res.headers.get('X-Jell0-Routed'), 'X-Jell0-Lane': plan.lane }
   if (!res.ok) {

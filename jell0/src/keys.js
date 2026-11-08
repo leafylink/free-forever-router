@@ -192,18 +192,28 @@ export async function d1KeyOk(env, key) {
   const hit = d1Cache.get(hash)
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.ok
   let ok = false
+  let lanes = []
   try {
     const row = await env.JELL0_DB
-      .prepare('SELECT 1 AS ok FROM jell0_keys WHERE hash = ?1 AND revoked_at IS NULL LIMIT 1')
+      .prepare("SELECT lanes FROM jell0_keys WHERE hash = ?1 AND revoked_at IS NULL AND disabled = 0 AND (expires_at IS NULL OR expires_at > datetime('now')) LIMIT 1")
       .bind(hash)
       .first()
     ok = !!row
+    lanes = row ? String(row.lanes || '').split(',').map(s => s.trim()).filter(Boolean) : []
   } catch {
     return false
   }
   while (d1Cache.size >= CACHE_MAX) d1Cache.delete(d1Cache.keys().next().value)
-  d1Cache.set(hash, { ok, at: Date.now() })
+  d1Cache.set(hash, { ok, lanes, at: Date.now() })
   return ok
+}
+
+// The lanes a jell0 key may use (empty = all). Read after keyKind, from the 60 s cache.
+export async function keyLanes(env, request) {
+  const key = keyFromRequest(request)
+  if (!key) return []
+  const hit = d1Cache.get(await sha256hex(key))
+  return hit && hit.ok ? hit.lanes || [] : []
 }
 
 // ---------------------------------------------------------------- model routes

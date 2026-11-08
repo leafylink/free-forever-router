@@ -7,17 +7,16 @@ import { clearKeyCache } from '../src/keys.js'
 
 function d1() {
   const db = new DatabaseSync(':memory:')
-  db.exec(`CREATE TABLE jell0_keys (hash TEXT PRIMARY KEY, label TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT, hint TEXT NOT NULL DEFAULT '');
-CREATE TABLE jell0_admin (id INTEGER PRIMARY KEY CHECK (id = 1), pw_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
-CREATE TABLE jell0_setup (id INTEGER PRIMARY KEY CHECK (id = 1), open_until TEXT NOT NULL);
-CREATE TABLE jell0_sessions (token_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL);`)
+  db.exec(`CREATE TABLE jell0_keys (hash TEXT PRIMARY KEY, label TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT, hint TEXT NOT NULL DEFAULT '', lanes TEXT NOT NULL DEFAULT '', expires_at TEXT, disabled INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE jell0_admin (id INTEGER PRIMARY KEY CHECK (id = 1), username TEXT NOT NULL, pw_hash TEXT NOT NULL, salt TEXT NOT NULL, must_change INTEGER NOT NULL DEFAULT 1, temp_expires TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+CREATE TABLE jell0_sessions (token_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL, must_change INTEGER NOT NULL DEFAULT 0);`)
   const stmt = (sql, args = []) => ({
     bind: (...a) => stmt(sql, a),
     first: async () => db.prepare(sql).get(...args) ?? null,
     all: async () => ({ results: db.prepare(sql).all(...args) }),
     run: async () => { const r = db.prepare(sql).run(...args); return { meta: { changes: Number(r.changes) } } },
   })
-  return { raw: db, prepare: sql => stmt(sql.replace(/\?\d+/g, '?')) }
+  return { raw: db, prepare: sql => stmt(sql) }
 }
 
 function envWith(db) {
@@ -40,51 +39,60 @@ async function call(env, path, data, extra = {}) {
   return { status: res.status, body: res.headers.get('Content-Type')?.includes('json') ? await res.json() : await res.text() }
 }
 
-test('key page: setup window, password, mint, use, revoke, sign out', async () => {
+import { pbkdf2 } from '../src/keypage.js'
+async function seedAdmin(db, temp) {
+  const salt = '00112233445566778899aabbccddeeff'
+  db.raw.prepare("INSERT INTO jell0_admin (id, username, pw_hash, salt, must_change, temp_expires) VALUES (1, 'owner', ?, ?, 1, datetime('now', '+2 days'))").run(await pbkdf2(temp, salt), salt)
+}
+const ask = (model, key) => [ '/v1/chat/completions', { model, messages: [{ role: 'user', content: 'hi' }] }, { Authorization: 'Bearer ' + key } ]
+
+test('token manager: temp password forces a new one, mint with limits, lanes enforced, off, retire', async () => {
   const db = d1(); const env = envWith(db); cookie = ''
-  const page = await call(env, '/keys')
-  assert.equal(page.status, 200)
-  assert.match(page.body, /jell0 keys/)
+  await seedAdmin(db, 'temporary-pass-123')
+  assert.match((await call(env, '/keys')).body, /jell0 API token manager/)
+  assert.equal((await call(env, '/keys/api/login', { username: 'owner', password: 'nope-nope-nope' })).status, 401)
+  assert.equal((await call(env, '/keys/api/login', { username: 'other', password: 'temporary-pass-123' })).status, 401)
+  const first = await call(env, '/keys/api/login', { username: 'Owner ', password: 'temporary-pass-123' })
+  assert.equal(first.body.mustChange, true)
+  assert.equal((await call(env, '/keys/api/mint', { label: 'x' })).status, 403, 'nothing works before the password is changed')
+  assert.equal((await call(env, '/keys/api/password', { password: 'short' })).status, 400)
+  assert.equal((await call(env, '/keys/api/password', { password: 'my-own-password-99' })).status, 200)
+  assert.equal(db.raw.prepare('SELECT must_change FROM jell0_admin').get().must_change, 0)
 
-  // No setup window: setup refused.
-  assert.equal((await call(env, '/keys/api/setup', { password: 'a-long-password-1' })).status, 403)
-  db.raw.exec("INSERT INTO jell0_setup (id, open_until) VALUES (1, datetime('now', '+15 minutes'))")
-  assert.equal((await call(env, '/keys/api/setup', { password: 'short' })).status, 400)
-  assert.equal((await call(env, '/keys/api/setup', { password: 'a-long-password-1' })).status, 200)
-  // Second setup refused even with a window.
-  db.raw.exec("INSERT OR REPLACE INTO jell0_setup (id, open_until) VALUES (1, datetime('now', '+15 minutes'))")
-  assert.equal((await call(env, '/keys/api/setup', { password: 'another-password-2' })).status, 409)
+  const fast = await call(env, '/keys/api/mint', { label: 'fast only', lanes: ['fast', 'nonsense'], days: 30 })
+  const any = await call(env, '/keys/api/mint', { label: 'everything' })
+  assert.match(fast.body.key, /^jell0-[0-9a-f]{64}$/)
+  const rows = db.raw.prepare('SELECT label, lanes, expires_at FROM jell0_keys ORDER BY label').all()
+  assert.deepEqual(rows.map(r => r.lanes), ['', 'fast'])
+  assert.ok(rows.find(r => r.label === 'fast only').expires_at)
+  assert.ok(!JSON.stringify(db.raw.prepare('SELECT * FROM jell0_keys').all()).includes(fast.body.key))
 
-  const minted = await call(env, '/keys/api/mint', { label: 'box cataloger' })
-  assert.equal(minted.status, 200)
-  assert.match(minted.body.key, /^jell0-[0-9a-f]{64}$/)
-  const stored = db.raw.prepare('SELECT * FROM jell0_keys').all()
-  assert.equal(stored.length, 1)
-  assert.ok(!JSON.stringify(stored).includes(minted.body.key), 'the key itself is never stored')
-
-  // The minted key works on a model route.
-  clearKeyCache()
-  const savedCookie = cookie; cookie = ''
-  const chat = await call(env, '/v1/chat/completions', { model: 'jell0-fast', messages: [{ role: 'user', content: 'hi' }] }, { Authorization: 'Bearer ' + minted.body.key })
-  assert.equal(chat.status, 200)
-  cookie = savedCookie
-
-  const list = await call(env, '/keys/api/list')
-  assert.equal(list.body.keys[0].label, 'box cataloger')
-  assert.equal(list.body.keys[0].hint, minted.body.key.slice(-4))
-  assert.ok(!JSON.stringify(list.body).includes(minted.body.key))
-
-  assert.equal((await call(env, '/keys/api/revoke', { id: list.body.keys[0].id })).body.revoked, 1)
-  clearKeyCache(); const keep = cookie; cookie = ''
-  assert.equal((await call(env, '/v1/chat/completions', { model: 'jell0-fast', messages: [{ role: 'user', content: 'hi' }] }, { Authorization: 'Bearer ' + minted.body.key })).status, 401)
+  const keep = cookie; cookie = ''; clearKeyCache()
+  assert.equal((await call(env, ...ask('jell0-fast', fast.body.key))).status, 200)
+  assert.equal((await call(env, ...ask('jell0-flagship', fast.body.key))).status, 403, 'lane outside the token limits')
+  assert.equal((await call(env, ...ask('jell0-flagship', any.body.key))).status, 200)
   cookie = keep
+
+  const list = (await call(env, '/keys/api/list')).body.keys
+  const f = list.find(k => k.label === 'fast only')
+  assert.equal((await call(env, '/keys/api/update', { id: f.id, lanes: 'fast', disabled: true })).body.changed, 1)
+  cookie = ''; assert.equal((await call(env, ...ask('jell0-fast', fast.body.key))).status, 401, 'turned off'); cookie = keep
+  const a = list.find(k => k.label === 'everything')
+  assert.equal((await call(env, '/keys/api/revoke', { id: a.id })).body.changed, 1)
+  cookie = ''; assert.equal((await call(env, ...ask('jell0-fast', any.body.key))).status, 401, 'retired'); cookie = keep
 
   assert.equal((await call(env, '/keys/api/logout', {})).status, 200)
   cookie = ''
-  assert.equal((await call(env, '/keys/api/mint', { label: 'x' })).status, 401)
-  assert.equal((await call(env, '/keys/api/login', { password: 'wrong-password-xx' })).status, 401)
-  assert.equal((await call(env, '/keys/api/login', { password: 'a-long-password-1' })).status, 200)
-  assert.equal((await call(env, '/keys/api/list')).status, 200)
+  assert.equal((await call(env, '/keys/api/list')).status, 401)
+  assert.equal((await call(env, '/keys/api/login', { username: 'owner', password: 'temporary-pass-123' })).status, 401, 'temp password is gone')
+  assert.equal((await call(env, '/keys/api/login', { username: 'owner', password: 'my-own-password-99' })).body.mustChange, false)
+})
+
+test('token manager: an expired temporary password is refused', async () => {
+  const db = d1(); const env = envWith(db); cookie = ''
+  await seedAdmin(db, 'temporary-pass-123')
+  db.raw.exec("UPDATE jell0_admin SET temp_expires = datetime('now', '-1 hour')")
+  assert.equal((await call(env, '/keys/api/login', { username: 'owner', password: 'temporary-pass-123' })).status, 401)
 })
 
 test('key page: no session, forged cookie or other origin cannot mint', async () => {

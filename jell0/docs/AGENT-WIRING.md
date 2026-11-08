@@ -9,8 +9,9 @@ There is no OpenRouter, no Hugging Face, no local model, no other provider behin
 
 ## 1. Get a key (self-serve, no person needed)
 
-People: open https://jell0-router.jonathan-d7a.workers.dev/keys , sign in with the jell0 key-page
-password, type a name and press Make key. The key is shown once.
+People: the jell0 API token manager at https://jell0-router.jonathan-d7a.workers.dev/keys . Sign in,
+name the token, pick the lanes it may use and an optional end date, press Make token. Shown once.
+Tokens can be turned off, limited or retired there.
 
 Agents:
 
