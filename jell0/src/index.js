@@ -19,6 +19,7 @@
 import { anthropicToOpenAI, openAIToAnthropic, openAISSEToAnthropicSSE, countTokens, anthropicError, serverToolsOnly } from './anthropic.js'
 import { planRoute, modelList, biggestContext } from './catalog.js'
 import { runChain } from './workersai.js'
+import { keyPage } from './keypage.js'
 import { adminOk, adminOff, keyKind, keyFromRequest, addKvKey, listKvKeys, loadOldKeys, deleteKvKey, overLimit, sha256hex } from './keys.js'
 
 const CORS = {
@@ -228,6 +229,10 @@ async function route(request, env) {
     if (p.endsWith('/chat/completions')) return chat(request, env)
     if (p === '/v1/messages' || p === '/messages') return messages(request, env)
     if (p === '/v1/messages/count_tokens' || p === '/messages/count_tokens') return count(request, env)
+  }
+  if (p === '/keys' || p.startsWith('/keys/api/')) {
+    const r = await keyPage(request, env, url, p)
+    if (r) return r
   }
   if (p === '/api/jell0/keys' && ['GET', 'POST', 'DELETE'].includes(method)) return admin(request, env, () => keysApi(request, env, url))
   if (p === '/api/jell0/session' && method === 'GET') return admin(request, env, () => json({ ok: true, authed: true, via: 'admin token' }), { why: true })
