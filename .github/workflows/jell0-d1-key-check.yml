@@ -1,0 +1,31 @@
+# Manual check that a jell0 D1 key works on the live jell0. Makes a temporary key in the runner
+# (masked), registers its hash in jell0_keys, calls jell0 with it, prints status and body, then
+# retires and deletes it.
+name: jell0 d1 key check
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  BASE: https://jell0-router.jonathan-d7a.workers.dev
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check
+        run: |
+          set -u
+          KEY="jell0-$(openssl rand -hex 32)"; echo "::add-mask::$KEY"
+          HASH=$(printf %s "$KEY" | sha256sum | cut -d' ' -f1)
+          npx --yes wrangler@4 d1 execute jell0 --remote --command "INSERT INTO jell0_keys (hash, label) VALUES ('$HASH', 'd1 key check (temporary)')" 2>&1 | tail -3
+          for i in 1 2 3; do
+            curl -s -D h.txt -o b.txt -w 'status %{http_code}\n' -X POST "$BASE/v1/chat/completions" -H "Authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"model":"jell0-fast","max_tokens":64,"messages":[{"role":"user","content":"Say ok."}]}'
+            grep -i '^x-jell0' h.txt; head -c 300 b.txt; echo
+            sleep 5
+          done
+          npx --yes wrangler@4 d1 execute jell0 --remote --command "DELETE FROM jell0_keys WHERE hash = '$HASH'" 2>&1 | tail -1
