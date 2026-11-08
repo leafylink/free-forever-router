@@ -1,0 +1,88 @@
+# Owner, 2026-11-08: "add a universal jell0 API key to Cloudflare for all editor projects and agents".
+# Manual, main only. Makes one universal jell0 key inside the runner (masked, never printed), then:
+#   1. stores its SHA-256 in jell0's KV, so jell0 accepts it (label "universal");
+#   2. stores the key in the account's Cloudflare Secrets Store as JELL0_API_KEY (scope workers),
+#      so any Worker can bind it (secrets_store_secrets binding);
+#   3. attaches it as a private run artifact kept 1 day, so the owner can hand it to agents that
+#      do not run on Cloudflare (the box). Delete the artifact once it is copied.
+# Re-running makes a NEW key and replaces the Secrets Store value; the old key keeps working until
+# its KV entry is deleted.
+name: jell0 universal key
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE: https://jell0-router.jonathan-d7a.workers.dev
+  KV_ID: 5ca5fe6524674fd68d001c0c583de130
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  key:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Make the key and register it with jell0 (hash only)
+        run: |
+          set -eu
+          KEY="jell0-$(openssl rand -hex 32)"
+          echo "::add-mask::$KEY"
+          echo "UKEY=$KEY" >> "$GITHUB_ENV"
+          HASH=$(printf %s "$KEY" | sha256sum | cut -d' ' -f1)
+          META='{"id":"universal","label":"universal (all editor projects and agents)","hint":"'"${KEY: -4}"'","created":"'"$(date -u +%FT%TZ)"'"}'
+          npx --yes wrangler@4 kv key put "key:$HASH" "$META" --namespace-id "$KV_ID" --metadata "$META" --remote > /dev/null
+          echo "registered with jell0 (hash only)"
+
+      - name: Check jell0 accepts it
+        run: |
+          set -u
+          for i in $(seq 1 12); do
+            s=$(curl -s -o /tmp/b -D /tmp/h -w '%{http_code}' --max-time 60 -X POST -H "Authorization: Bearer $UKEY" \
+              -H 'content-type: application/json' -d '{"model":"jell0-fast","max_tokens":64,"messages":[{"role":"user","content":"Say ok."}]}' \
+              "$BASE/v1/chat/completions")
+            echo "try $i: $s $(grep -i '^x-jell0-routed:' /tmp/h | tr -d '\r')"
+            [ "$s" = "200" ] && exit 0
+            sleep 10
+          done
+          exit 1
+
+      - name: Store it in the Cloudflare Secrets Store as JELL0_API_KEY
+        run: |
+          set -eu
+          npx --yes wrangler@4 secrets-store store list --remote > stores.txt 2>&1 || true
+          STORE=$(grep -oE '[0-9a-f]{32}' stores.txt | head -n 1 || true)
+          if [ -z "$STORE" ]; then
+            npx --yes wrangler@4 secrets-store store create default_secrets_store --remote > created.txt 2>&1
+            STORE=$(grep -oE '[0-9a-f]{32}' created.txt | head -n 1)
+          fi
+          echo "store: $STORE"
+          npx --yes wrangler@4 secrets-store secret list "$STORE" --remote > secrets.txt 2>&1 || true
+          OLD=$(grep -E 'JELL0_API_KEY' secrets.txt | grep -oE '[0-9a-f]{32}' | head -n 1 || true)
+          if [ -n "$OLD" ]; then
+            npx --yes wrangler@4 secrets-store secret update "$STORE" --secret-id "$OLD" --value "$UKEY" --remote > /dev/null
+            echo "updated JELL0_API_KEY"
+          else
+            npx --yes wrangler@4 secrets-store secret create "$STORE" --name JELL0_API_KEY --value "$UKEY" --scopes workers --remote > /dev/null
+            echo "created JELL0_API_KEY"
+          fi
+          echo "STORE_ID=$STORE" >> "$GITHUB_STEP_SUMMARY"
+          rm -f stores.txt created.txt secrets.txt
+
+      - name: Private copy for agents off Cloudflare (1 day)
+        run: |
+          umask 077
+          printf '%s\n' "$UKEY" > jell0-universal-key.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jell0-universal-key
+          path: jell0-universal-key.txt
+          retention-days: 1
