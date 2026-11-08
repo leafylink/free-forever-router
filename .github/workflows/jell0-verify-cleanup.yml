@@ -1,0 +1,152 @@
+# One-off, after a jell0 deploy (owner's word, 2026-11-08: "Deploy jell0").
+# Manual only, from main. Two jobs:
+#   verify:  makes a temporary model key inside the runner (masked, never printed), stores only its
+#            SHA-256 in KV as a jell0 key, makes real model calls through the live jell0 (fast lane,
+#            flagship, a stream, and Claude Code's /v1/messages), then deletes that key. Fails if any
+#            call does not answer 200 from a Workers AI model.
+#   cleanup: only after verify passes. Deletes the secrets the old jell0 held from the jell0-router
+#            Worker (five provider keys and the old admin token; jell0 reads none of them now, and
+#            admin stays off until a fresh v2 token is set) and the old KV entries that held provider
+#            keys, the old admin login and the old plain-text key list. Prints names only.
+name: jell0 verify and cleanup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jell0-deploy
+  cancel-in-progress: false
+
+env:
+  BASE: https://jell0-router.jonathan-d7a.workers.dev
+  KV_ID: 5ca5fe6524674fd68d001c0c583de130
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Make a temporary key (only its SHA-256 goes to KV)
+        run: |
+          set -eu
+          KEY="jell0-$(openssl rand -hex 24)"
+          echo "::add-mask::$KEY"
+          HASH=$(printf %s "$KEY" | sha256sum | cut -d' ' -f1)
+          echo "VERIFY_KEY=$KEY" >> "$GITHUB_ENV"
+          echo "VERIFY_HASH=$HASH" >> "$GITHUB_ENV"
+          META='{"id":"deploy-verify","label":"deploy verify (temporary)","hint":"temp","created":"'"$(date -u +%FT%TZ)"'"}'
+          npx --yes wrangler@4 kv key put "key:$HASH" "$META" --namespace-id "$KV_ID" --metadata "$META" --remote > /dev/null
+          echo "temporary key stored (hash only)"
+
+      - name: Real model calls through jell0
+        run: |
+          set -u
+          fail=0
+          tmp=$(mktemp -d)
+          call() { # name, path, json body, extra header
+            local name="$1" path="$2" body="$3" extra="${4:-}"
+            local status routed
+            status=$(curl -s -o "$tmp/body" -D "$tmp/headers" -w '%{http_code}' --max-time 120 -X POST \
+              -H "Authorization: Bearer $VERIFY_KEY" -H 'content-type: application/json' ${extra:+-H "$extra"} \
+              -d "$body" "$BASE$path")
+            routed=$(grep -i '^x-jell0-routed:' "$tmp/headers" | head -n 1 | cut -d' ' -f2- | tr -d '\r')
+            echo "$name: status $status, routed '$routed'"
+            head -c 300 "$tmp/body" | tr '\n' ' '; echo
+            if [ "$status" = "200" ] && [ "${routed#workersai/}" != "$routed" ]; then echo "ok   $name"; else echo "FAIL $name"; fail=1; fi
+          }
+
+          # KV is eventually consistent: wait until the new key is seen (401 means not yet).
+          for i in $(seq 1 12); do
+            s=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X POST -H "Authorization: Bearer $VERIFY_KEY" \
+              -H 'content-type: application/json' -d '{"model":"jell0-fast","max_tokens":8,"messages":[{"role":"user","content":"Say ok."}]}' \
+              "$BASE/v1/chat/completions")
+            echo "key check $i: $s"
+            [ "$s" != "401" ] && break
+            sleep 10
+          done
+
+          call "fast lane (OpenAI)" /v1/chat/completions \
+            '{"model":"jell0-fast","max_tokens":32,"messages":[{"role":"user","content":"Reply with the single word ok."}]}'
+          call "flagship (OpenAI, GLM-5.3 first)" /v1/chat/completions \
+            '{"model":"jell0-flagship","max_tokens":512,"reasoning_effort":"low","messages":[{"role":"user","content":"Reply with the single word ok."}]}'
+          call "Claude Code style (/v1/messages)" /v1/messages \
+            '{"model":"claude-sonnet-4-5","max_tokens":512,"messages":[{"role":"user","content":"Reply with the single word ok."}]}' \
+            'anthropic-version: 2023-06-01'
+
+          # streaming: OpenAI chunks ending with [DONE]
+          curl -s -N --max-time 120 -X POST -H "Authorization: Bearer $VERIFY_KEY" -H 'content-type: application/json' \
+            -d '{"model":"jell0-fast","stream":true,"max_tokens":32,"messages":[{"role":"user","content":"Count to three."}]}' \
+            "$BASE/v1/chat/completions" > "$tmp/stream"
+          chunks=$(grep -c '^data: {' "$tmp/stream" || true)
+          if grep -q '^data: \[DONE\]' "$tmp/stream" && [ "$chunks" -gt 0 ]; then echo "ok   stream ($chunks chunks, [DONE])"; else echo "FAIL stream"; head -c 300 "$tmp/stream"; echo; fail=1; fi
+
+          rm -rf "$tmp"
+          exit $fail
+
+      - name: Delete the temporary key
+        if: always()
+        run: |
+          set -u
+          if [ -n "${VERIFY_HASH:-}" ]; then
+            npx --yes wrangler@4 kv key delete "key:$VERIFY_HASH" --namespace-id "$KV_ID" --remote > /dev/null && echo "temporary key deleted"
+          fi
+
+  cleanup:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Delete the old jell0 secrets (names only)
+        run: |
+          set -eu
+          npx --yes wrangler@4 secret list --name jell0-router --format json > secrets.json
+          echo "secrets on jell0-router before: $(jq -r '[.[].name] | join(", ")' secrets.json)"
+          for s in OPENROUTER_API_KEY HUGGINGFACE_TOKEN DEEPSEEK_API_KEY ORCAROUTER_API_KEY GEMINI_API_KEY JELL0_ADMIN_TOKEN; do
+            if jq -e --arg s "$s" 'map(.name) | index($s) != null' secrets.json > /dev/null; then
+              npx --yes wrangler@4 secret delete "$s" --name jell0-router > /dev/null && echo "deleted secret $s"
+            else
+              echo "secret $s not present"
+            fi
+          done
+          npx --yes wrangler@4 secret list --name jell0-router --format json > after.json
+          echo "secrets on jell0-router after: $(jq -r '[.[].name] | join(", ")' after.json)"
+          rm -f secrets.json after.json
+
+      - name: Delete the old KV entries (names only)
+        run: |
+          set -eu
+          npx --yes wrangler@4 kv key list --namespace-id "$KV_ID" --remote > keys.json
+          echo "KV keys before: $(jq -r '[.[].name | if startswith("key:") then "key:<hash>" else . end] | join(", ")' keys.json)"
+          for k in providers user api_keys; do
+            if jq -e --arg k "$k" 'map(.name) | index($k) != null' keys.json > /dev/null; then
+              npx --yes wrangler@4 kv key delete "$k" --namespace-id "$KV_ID" --remote > /dev/null && echo "deleted KV $k"
+            else
+              echo "KV $k not present"
+            fi
+          done
+          npx --yes wrangler@4 kv key list --namespace-id "$KV_ID" --remote > after.json
+          echo "KV keys after: $(jq -r '[.[].name | if startswith("key:") then "key:<hash>" else . end] | join(", ")' after.json)"
+          rm -f keys.json after.json
+
+      - name: Live checks after cleanup (no key)
+        run: |
+          set -u
+          fail=0
+          s=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/health"); [ "$s" = "200" ] && echo "ok   health" || { echo "FAIL health $s"; fail=1; }
+          s=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d '{"label":"x"}' "$BASE/api/jell0/keys")
+          [ "$s" = "401" ] && echo "ok   admin refused (401)" || { echo "FAIL admin $s"; fail=1; }
+          curl -s "$BASE/api/jell0/session" -H 'Authorization: Bearer not-a-token' | head -c 300; echo
+          exit $fail
