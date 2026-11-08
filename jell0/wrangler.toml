@@ -25,12 +25,12 @@ id = "5ca5fe6524674fd68d001c0c583de130"
 [ai]
 binding = "AI"
 
-# LeafyLink D1: mgr_api_key, to accept Manager keys whose only permission is "ai_models".
-# jell0 only reads it; the binding itself can write.
+# jell0's own D1: jell0_keys holds the SHA-256 of self-serve keys (docs/AGENT-WIRING.md).
+# jell0 is not tied to the LeafyLink Manager. jell0 only reads it; the binding itself can write.
 [[d1_databases]]
-binding = "MGR_DB"
-database_name = "leafylink"
-database_id = "e2dcd27b-90d7-4108-8791-081ed33e7769"
+binding = "JELL0_DB"
+database_name = "jell0"
+database_id = "3926a761-94e6-4a41-a981-198c8427f01a"
 
 # Rate limits (Workers Rate Limiting, per Cloudflare location, approximate). JELL0_IP_LIMIT runs
 # first on every model route, before any KV or D1 lookup, keyed by the caller's IP. JELL0_KEY_LIMIT

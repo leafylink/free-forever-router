@@ -592,3 +592,19 @@ test('WAI-5: 3006 "Request is too large" stops the chain at once with a 400', as
   assert.match((await r.json()).error.message, /Request is too large/)
   assert.equal(aiCalls.length, 1)
 })
+
+// Self-serve keys in jell0's own D1 (owner, 2026-11-08: every agent must be able to use jell0).
+import { d1KeyOk as _d1KeyOk, sha256hex as _sha, clearKeyCache as _clr } from '../src/keys.js'
+test('d1 self-serve key: registered hash works, revoked or unknown does not, D1 error refuses', async () => {
+  _clr()
+  const good = 'jell0-' + 'a'.repeat(40)
+  const h = await _sha(good)
+  const db = (rows) => ({ prepare: () => ({ bind: (x) => ({ first: async () => rows[x] || null }) }) })
+  assert.equal(await _d1KeyOk({ JELL0_DB: db({ [h]: { ok: 1 } }) }, good), true)
+  _clr()
+  assert.equal(await _d1KeyOk({ JELL0_DB: db({}) }, good), false)
+  _clr()
+  assert.equal(await _d1KeyOk({ JELL0_DB: { prepare: () => { throw new Error('x') } } }, good), false)
+  assert.equal(await _d1KeyOk({ JELL0_DB: db({ [h]: { ok: 1 } }) }, 'short'), false)
+  assert.equal(await _d1KeyOk({}, good), false)
+})

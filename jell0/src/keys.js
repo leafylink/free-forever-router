@@ -143,6 +143,7 @@ const managerCache = new Map() // sha256 of key -> { ok, at }
 
 export function clearKeyCache() {
   managerCache.clear()
+  d1Cache.clear()
 }
 
 // A Manager API key works when its SHA-256 is in mgr_api_key, it is not
@@ -176,9 +177,38 @@ export async function managerKeyOk(env, key) {
   return ok
 }
 
+// ---------------------------------------------------------------- jell0 D1 keys (self-serve)
+
+// Keys registered in jell0's own D1 database (binding JELL0_DB, table jell0_keys):
+// any agent with Cloudflare access makes a random key itself and inserts only its
+// SHA-256, so no person has to hand keys out. Not revoked = valid. Cached 60 s
+// like Manager keys; any D1 error means not valid. Keys shorter than 32 characters
+// never reach D1.
+const d1Cache = new Map()
+
+export async function d1KeyOk(env, key) {
+  if (!key || key.length < 32 || key.length > 256 || !env.JELL0_DB) return false
+  const hash = await sha256hex(key)
+  const hit = d1Cache.get(hash)
+  if (hit && Date.now() - hit.at < CACHE_MS) return hit.ok
+  let ok = false
+  try {
+    const row = await env.JELL0_DB
+      .prepare('SELECT 1 AS ok FROM jell0_keys WHERE hash = ?1 AND revoked_at IS NULL LIMIT 1')
+      .bind(hash)
+      .first()
+    ok = !!row
+  } catch {
+    return false
+  }
+  while (d1Cache.size >= CACHE_MAX) d1Cache.delete(d1Cache.keys().next().value)
+  d1Cache.set(hash, { ok, at: Date.now() })
+  return ok
+}
+
 // ---------------------------------------------------------------- model routes
 
-// Which kind of key the request carries: 'kv', 'manager', or null.
+// Which kind of key the request carries: 'kv', 'd1', 'manager', or null.
 // Bearer or x-api-key. The admin token is never a model key.
 export async function keyKind(env, request) {
   const key = keyFromRequest(request)
@@ -186,6 +216,7 @@ export async function keyKind(env, request) {
   const t = adminToken(env)
   if (t && await sameSecret(key, t)) return null
   if (await kvKeyOk(env, key)) return 'kv'
+  if (await d1KeyOk(env, key)) return 'd1'
   if (await managerKeyOk(env, key)) return 'manager'
   return null
 }

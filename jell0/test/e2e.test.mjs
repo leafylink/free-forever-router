@@ -54,6 +54,7 @@ function makeEnv(ai) {
     // Workers Rate Limiting bindings that never refuse here
     JELL0_IP_LIMIT: { async limit() { return { success: true } } },
     JELL0_KEY_LIMIT: { async limit() { return { success: true } } },
+    JELL0_DB: { prepare() { return { bind() { return { async first() { return null } } } } } },
     MGR_DB: {
       prepare(sql) {
         sqls.push(sql)

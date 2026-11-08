@@ -113,7 +113,7 @@ function makeEnv({ ai, mgrRows, adminToken = ADMIN, strict = true } = {}) {
     },
   }
   if (adminToken !== undefined) base.JELL0_ADMIN_TOKEN = adminToken
-  const allowed = new Set(['AI', 'JELL0_CONFIG', 'MGR_DB', 'JELL0_ADMIN_TOKEN', 'JELL0_IP_LIMIT', 'JELL0_KEY_LIMIT'])
+  const allowed = new Set(['AI', 'JELL0_CONFIG', 'MGR_DB', 'JELL0_DB', 'JELL0_ADMIN_TOKEN', 'JELL0_IP_LIMIT', 'JELL0_KEY_LIMIT'])
   const env = strict
     ? new Proxy(base, {
         get(t, k) {
@@ -773,7 +773,7 @@ test('env: jell0 reads only AI, JELL0_CONFIG, MGR_DB, the two rate limiters and 
   for (const f of ['index.js', 'catalog.js', 'workersai.js', 'keys.js']) {
     const src = readFileSync(join(JELL0, 'src', f), 'utf8')
     for (const m of src.matchAll(/env\.([A-Za-z_][A-Za-z0-9_]*)/g)) {
-      assert.ok(['AI', 'JELL0_CONFIG', 'MGR_DB', 'JELL0_ADMIN_TOKEN', 'JELL0_IP_LIMIT', 'JELL0_KEY_LIMIT'].includes(m[1]), f + ' reads env.' + m[1])
+      assert.ok(['AI', 'JELL0_CONFIG', 'MGR_DB', 'JELL0_DB', 'JELL0_ADMIN_TOKEN', 'JELL0_IP_LIMIT', 'JELL0_KEY_LIMIT'].includes(m[1]), f + ' reads env.' + m[1])
     }
     assert.ok(!/env\[/.test(src), f + ' reads env by computed key')
     assert.ok(!/\bfetch\(/.test(src.replace(/async fetch\(request, env\)/, '')), f + ' calls fetch (no outside provider allowed)')
@@ -849,5 +849,5 @@ test('files: no em or en dashes; wrangler.toml has no routes and keeps workers.d
   assert.match(toml, /^keep_vars = true$/m)
   assert.match(toml, /binding = "AI"/)
   assert.match(toml, /binding = "JELL0_CONFIG"/)
-  assert.match(toml, /binding = "MGR_DB"/)
+  assert.match(toml, /binding = "JELL0_DB"/)
 })
